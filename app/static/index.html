@@ -43,6 +43,13 @@
   .demo b { display:block; margin-bottom:3px; }
   .demo .actions { margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; }
   .demo button { padding:5px 10px; font-size:12px; }
+  .stall-box { margin-top:14px; border:1px dashed var(--line); border-radius:8px;
+               padding:10px 12px; background:#f8fafc; }
+  .checkline { display:flex; gap:8px; align-items:flex-start; font-size:12.5px;
+               font-weight:600; margin:0; cursor:pointer; }
+  .checkline input { margin-top:2px; }
+  .stall-box input[type=number] { width:120px; margin-top:6px; }
+  .stall-on { border-color:#f59e0b; background:#fffbeb; }
   .jobs { display:flex; flex-direction:column; gap:14px; }
   .job { border:1px solid var(--line); border-radius:10px; padding:14px 16px;
          background:#fff; }
@@ -108,6 +115,21 @@
       <textarea id="sql" name="sql" placeholder="SELECT item, SUM(1 // CAST(value AS INTEGER)) FROM readings GROUP BY item" required></textarea>
       <div class="hint">仅允许单条只读 SELECT/WITH；禁止随机函数等非确定性表达式与多语句。</div>
 
+      <div class="stall-box">
+        <label class="checkline">
+          <input type="checkbox" id="stall-toggle" />
+          <span>演示：模拟「试跑进程停止接收输入」（输入传送未完成时取消/超时）</span>
+        </label>
+        <div id="stall-controls" hidden>
+          <label for="stall-seconds">子进程在读取 stdin 前停顿（秒，建议 ≥ 3）</label>
+          <input type="number" id="stall-seconds" min="0" max="60" step="0.5" value="6" />
+          <div class="hint">
+            2 秒限额仍从进程启动起算。停顿期间输入只送出管道缓冲的一小部分；
+            超时或取消都应先停止并回收本次进程、结束输入传送，再报终态且不发布样本。
+          </div>
+        </div>
+      </div>
+
       <div class="row">
         <button class="primary" type="submit" id="submit-btn">提交任务</button>
         <span class="muted">可在多个浏览器窗口同时提交，任务与取消互不干扰。</span>
@@ -156,6 +178,9 @@ $("#job-form").addEventListener("submit", async (ev) => {
   if (!f || !sql) { toast("请选择 CSV 并填写 SQL"); return; }
   const fd = new FormData();
   fd.append("file", f); fd.append("sql", sql);
+  if ($("#stall-toggle").checked) {
+    fd.append("demo_input_stall_seconds", String(parseFloat($("#stall-seconds").value) || 0));
+  }
   const btn = $("#submit-btn"); btn.disabled = true; btn.textContent = "提交中…";
   try {
     const r = await fetch("/api/jobs", { method:"POST", body: fd });
@@ -174,6 +199,15 @@ $("#file").addEventListener("change", () => {
   $("#file-hint").textContent = f ? `已选择：${f.name}（${f.size} 字节）` : "";
 });
 
+// ------------------------------------------------ input-stall demo controls
+function syncStallControls() {
+  const on = $("#stall-toggle").checked;
+  $("#stall-controls").hidden = !on;
+  $("#stall-toggle").closest(".stall-box").classList.toggle("stall-on", on);
+}
+$("#stall-toggle").addEventListener("change", syncStallControls);
+syncStallControls();
+
 // -------------------------------------------------------------------- demos
 async function loadDemos() {
   try {
@@ -184,6 +218,7 @@ async function loadDemos() {
         <b>${esc(d.name)}</b>
         <div>${esc(d.description)}</div>
         <div class="muted">异常：<code class="err">${esc(d.error_type)}</code> · ${esc(d.rows)} 行 → 期望最小 ${esc(d.expected_min_rows)} 行</div>
+        ${d.demo_input_stall_seconds ? `<div class="muted">含输入停顿演示：子进程暂停 ${esc(d.demo_input_stall_seconds)} 秒再读输入</div>` : ""}
         <div class="actions">
           <button class="ghost" data-demo="${esc(d.id)}" data-act="fill">填入查询</button>
           <a href="/api/demo/${esc(d.id)}/csv" download><button class="ghost" type="button">下载 CSV</button></a>
@@ -194,7 +229,16 @@ async function loadDemos() {
       if (!b) return;
       const demo = demos.find(d => d.id === b.dataset.demo);
       $("#sql").value = demo.sql;
-      toast(`已填入「${demo.name}」的查询，请选择对应的演示 CSV（可先下载查看）`);
+      if (demo.demo_input_stall_seconds) {
+        $("#stall-toggle").checked = true;
+        $("#stall-seconds").value = demo.demo_input_stall_seconds;
+        syncStallControls();
+        toast(`已填入「${demo.name}」并启用输入停顿演示；请下载并选择对应的演示 CSV`);
+      } else {
+        $("#stall-toggle").checked = false;
+        syncStallControls();
+        toast(`已填入「${demo.name}」的查询，请选择对应的演示 CSV（可先下载查看）`);
+      }
     });
   } catch (e) {
     $("#demos").innerHTML = '<span class="muted">演示信息加载失败</span>';
@@ -212,7 +256,8 @@ function renderJob(j) {
     : 0;
   const hist = (p.history || []).slice().reverse().map(h =>
     `<tr><td>${h.trial}</td><td>${h.rows_tested}</td><td>${esc(h.status)}</td>
-     <td>${esc(h.error_type ?? "")}</td></tr>`).join("");
+     <td>${esc(h.error_type ?? "")}</td>
+     <td>${h.input_bytes_total ? `${h.input_bytes_sent}/${h.input_bytes_total}${h.input_complete ? "" : " ✗"}` : "-"}</td></tr>`).join("");
   let msg = "";
   if (j.message) {
     const cls = j.status === "succeeded" || j.status === "no_error" ? "ok"
@@ -229,7 +274,14 @@ function renderJob(j) {
     ? `<a href="/api/jobs/${esc(j.id)}/download" download>
          <button class="primary" type="button">下载最小样本（${j.result_rows} 行）</button></a>` : "";
   const cancel = !TERMINAL.has(j.status)
-    ? `<button class="danger" type="button" data-cancel="${esc(j.id)}">取消任务</button>` : "";
+    ? (j.status === "canceling"
+        ? `<button class="danger" type="button" disabled>取消中，等待试跑停止…</button>`
+        : `<button class="danger" type="button" data-cancel="${esc(j.id)}">取消任务</button>`)
+    : "";
+  const stallBadge = j.input_stall_seconds > 0
+    ? `<span class="badge canceling">输入停顿演示 · ${esc(j.input_stall_seconds)}s</span>` : "";
+  const ioBlock = p.last_input_bytes_total > 0 ? `
+      <span class="k">最近试跑输入</span><span class="v">${p.last_input_bytes_sent} / ${p.last_input_bytes_total} 字节${p.last_input_complete ? "" : "（未送完）"} · 用时 ${p.last_elapsed_ms} ms</span>` : "";
   return `
   <div class="job" data-id="${esc(j.id)}">
     <div class="job-head">
@@ -238,6 +290,7 @@ function renderJob(j) {
         <div class="muted">创建于 ${new Date(j.created_at * 1000).toLocaleTimeString()} · 输入 ${j.total_rows} 行</div>
       </div>
       ${statusBadge(j.status)}
+      ${stallBadge}
     </div>
     <div class="bar"><i style="width:${pct}%"></i></div>
     <div class="kv">
@@ -245,12 +298,13 @@ function renderJob(j) {
       <span class="k">已完成试跑</span><span class="v">${p.trials_completed ?? 0} 次（每次独立进程/独立 DuckDB，限时 ${j.trial_timeout_seconds} 秒）</span>
       <span class="k">当前候选</span><span class="v">${p.current_rows ?? j.total_rows} 行 / 原始 ${j.total_rows} 行</span>
       <span class="k">最近试跑</span><span class="v">${esc(p.last_result || "-")}</span>
+      ${ioBlock}
     </div>
     ${errBlock}
     ${msg}
     <div class="history">
-      <table><thead><tr><th>#</th><th>试跑行数</th><th>结果</th><th>异常类</th></tr></thead>
-      <tbody>${hist || '<tr><td colspan="4" class="muted">暂无试跑</td></tr>'}</tbody></table>
+      <table><thead><tr><th>#</th><th>试跑行数</th><th>结果</th><th>异常类</th><th>输入字节</th></tr></thead>
+      <tbody>${hist || '<tr><td colspan="5" class="muted">暂无试跑</td></tr>'}</tbody></table>
     </div>
     <div class="row">${cancel}${download}</div>
   </div>`;

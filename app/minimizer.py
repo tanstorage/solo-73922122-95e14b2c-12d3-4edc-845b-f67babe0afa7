@@ -33,6 +33,12 @@ class Progress:
     last_result: str = ""        # short status of the last trial
     last_error_type: Optional[str] = None
     last_first_line: Optional[str] = None
+    # Input-transfer details of the last trial (proves that a timed-out or
+    # canceled trial was stopped even while its payload was still in flight).
+    last_input_bytes_sent: int = 0
+    last_input_bytes_total: int = 0
+    last_input_complete: bool = False
+    last_elapsed_ms: float = 0.0
     history: List[dict] = field(default_factory=list)
 
     def snapshot(self) -> dict:
@@ -45,12 +51,20 @@ class Progress:
             "last_result": self.last_result,
             "last_error_type": self.last_error_type,
             "last_first_line": self.last_first_line,
+            "last_input_bytes_sent": self.last_input_bytes_sent,
+            "last_input_bytes_total": self.last_input_bytes_total,
+            "last_input_complete": self.last_input_complete,
+            "last_elapsed_ms": self.last_elapsed_ms,
             "history": list(self.history[-50:]),
         }
 
 
 class TimeoutDuringMinimization(Exception):
     """Raised when a trial exceeds the per-trial 2 second limit."""
+
+    def __init__(self, result: Optional[TrialResult] = None) -> None:
+        super().__init__("trial exceeded the per-trial time limit")
+        self.result = result
 
 
 class MinimizationCanceled(Exception):
@@ -99,12 +113,20 @@ def ddmin(
         progress.trials_completed += 1
         progress.current_rows = len(indices)
         progress.last_result = result.status
+        progress.last_input_bytes_sent = result.input_bytes_sent
+        progress.last_input_bytes_total = result.input_bytes_total
+        progress.last_input_complete = result.input_complete
+        progress.last_elapsed_ms = result.elapsed_ms
         progress.history.append(
             {
                 "trial": progress.trials_completed,
                 "rows_tested": len(indices),
                 "status": result.status,
                 "error_type": result.error_type,
+                "input_bytes_sent": result.input_bytes_sent,
+                "input_bytes_total": result.input_bytes_total,
+                "input_complete": result.input_complete,
+                "elapsed_ms": result.elapsed_ms,
             }
         )
 
@@ -112,7 +134,7 @@ def ddmin(
             raise MinimizationCanceled()
         if result.status == "timeout":
             # The task is incomplete: no minimal sample may be published.
-            raise TimeoutDuringMinimization()
+            raise TimeoutDuringMinimization(result)
         if result.status in ("runner_crash",):
             # Infrastructure failure is not a reproduction; treat like a
             # non-reproducing outcome but keep it visible in the history.

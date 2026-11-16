@@ -63,6 +63,7 @@ class Job:
     result_path: Optional[str] = None
     result_rows: int = 0
     baseline_status: Optional[str] = None
+    input_stall_seconds: float = 0.0
     events: "queue.Queue[dict]" = field(default_factory=queue.Queue)
     finished_at: Optional[float] = None
 
@@ -82,6 +83,7 @@ class Job:
             and os.path.exists(self.result_path),
             "progress": self.progress.snapshot(),
             "trial_timeout_seconds": TRIAL_TIMEOUT_SECONDS,
+            "input_stall_seconds": self.input_stall_seconds,
         }
 
 
@@ -89,11 +91,19 @@ class JobManager:
     def __init__(self, work_root: str) -> None:
         self._jobs: Dict[str, Job] = {}
         self._lock = threading.Lock()
+        # Serializes terminal-state transitions (publish vs. cancel) so a
+        # cancel request can never race a result publication.
+        self._state_lock = threading.Lock()
         self._work_root = work_root
         os.makedirs(work_root, exist_ok=True)
 
     # ------------------------------------------------------------------ CRUD
-    def create_job(self, parsed: ParsedCsv, sql: str) -> Job:
+    def create_job(
+        self,
+        parsed: ParsedCsv,
+        sql: str,
+        input_stall_seconds: float = 0.0,
+    ) -> Job:
         sql = validate_select(sql)
         job_id = uuid.uuid4().hex
         job_dir = os.path.join(self._work_root, job_id)
@@ -111,7 +121,8 @@ class JobManager:
             fh.write(sql)
 
         job = Job(id=job_id, sql=sql, total_rows=len(parsed.rows),
-                  created_at=time.time())
+                  created_at=time.time(),
+                  input_stall_seconds=max(0.0, float(input_stall_seconds)))
         # Attach the parsed payload out-of-band (not part of public state).
         job._parsed = parsed  # type: ignore[attr-defined]
         job._job_dir = job_dir  # type: ignore[attr-defined]
@@ -143,14 +154,12 @@ class JobManager:
         job = self.get(job_id)
         if job is None:
             return None
-        if job.status not in TERMINAL_STATES:
-            job.cancel_event.set()
-            if job.status == "queued":
-                # Not started yet: the worker observes the event on startup.
-                job.status = "canceling"
-            elif job.status == "running":
-                job.status = "canceling"
-            self._emit(job, {"event": "cancel_requested", "id": job.id})
+        with self._state_lock:
+            if job.status not in TERMINAL_STATES:
+                job.cancel_event.set()
+                if job.status in ("queued", "running"):
+                    job.status = "canceling"
+                self._emit(job, {"event": "cancel_requested", "id": job.id})
         return job
 
     # ---------------------------------------------------------------- events
@@ -177,15 +186,23 @@ class JobManager:
         job_dir: str = job._job_dir  # type: ignore[attr-defined]
 
         def _run(rows):
-            return run_trial(rows, job.sql, job.cancel_event)
+            return run_trial(
+                rows,
+                job.sql,
+                job.cancel_event,
+                input_stall_seconds=job.input_stall_seconds,
+            )
         try:
             if job.cancel_event.is_set():
                 self._finish_canceled(job)
                 return
 
-            job.status = "running"
-            self._emit(job, {"event": "status", "id": job.id,
-                             "status": "running"})
+            # Do not clobber a "canceling" state set by a cancel request that
+            # raced with this worker starting up.
+            if job.status == "queued":
+                job.status = "running"
+                self._emit(job, {"event": "status", "id": job.id,
+                                 "status": "running"})
 
             # ------------------------------------------------------ baseline
             job.progress.phase = "baseline"
@@ -195,7 +212,7 @@ class JobManager:
                 self._finish_canceled(job)
                 return
             if baseline.status == "timeout":
-                self._finish_timeout(job, stage="baseline")
+                self._finish_timeout(job, stage="baseline", result=baseline)
                 return
             if baseline.status == "success":
                 # Original query works: nothing to reduce.
@@ -243,16 +260,23 @@ class JobManager:
             job.outcome = outcome
 
             # --------------------------------------------- publish artifact
-            subset_rows = [parsed.rows[i] for i in outcome.indices]
-            result_path = os.path.join(job_dir, "minimal_sample.csv")
-            with open(result_path, "w", encoding="utf-8", newline="") as fh:
-                fh.write(render_subset_csv(
-                    subset_rows, parsed.header, parsed.line_terminator
-                ))
-            job.result_path = result_path
-            job.result_rows = len(subset_rows)
-
-            job.status = "succeeded"
+            # Publication is serialized against cancellation: if a cancel
+            # request wins the lock first, the event is already set here and
+            # nothing is published.  `run_trial` has already reaped every
+            # process before ddmin returns.
+            with self._state_lock:
+                if job.cancel_event.is_set():
+                    self._finish_canceled(job)
+                    return
+                subset_rows = [parsed.rows[i] for i in outcome.indices]
+                result_path = os.path.join(job_dir, "minimal_sample.csv")
+                with open(result_path, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(render_subset_csv(
+                        subset_rows, parsed.header, parsed.line_terminator
+                    ))
+                job.result_path = result_path
+                job.result_rows = len(subset_rows)
+                job.status = "succeeded"
             job.message = (
                 f"已得到 1-最小样本：{job.total_rows} 行缩减至 "
                 f"{job.result_rows} 行，共 {outcome.trials_completed} 次试跑。"
@@ -264,9 +288,18 @@ class JobManager:
 
         except MinimizationCanceled:
             self._finish_canceled(job)
-        except TimeoutDuringMinimization:
-            self._finish_timeout(job, stage="minimize")
+        except TimeoutDuringMinimization as exc:
+            # Cancellation wins over a timeout that happened at the same moment:
+            # the user-visible terminal state must be `canceled` whenever a
+            # cancel request was accepted while the trial was still running.
+            if job.cancel_event.is_set():
+                self._finish_canceled(job)
+            else:
+                self._finish_timeout(job, stage="minimize", result=exc.result)
         except Exception as exc:  # noqa: BLE001 - surface as failed job
+            if job.cancel_event.is_set():
+                self._finish_canceled(job)
+                return
             job.status = "failed"
             job.message = f"任务失败：{type(exc).__name__}: {exc}"
             job.finished_at = time.time()
@@ -276,25 +309,43 @@ class JobManager:
     def _finish_canceled(self, job: Job) -> None:
         """Publish the canceled state only after trials are stopped.
 
-        The trial function blocks until the subprocess group is reaped, so by
-        the time MinimizationCanceled propagates here nothing is running.
+        ``run_trial`` does not return until the input writer is closed and the
+        trial process has exited/been reaped, so by the time this runs nothing
+        of this job is still running.  This is also enforced here rather than
+        trusted: an in-flight trial is always reaped inside ``run_trial``.
         """
-        # Belt-and-braces: ensure the event is set and give the worker a beat.
         job.cancel_event.set()
         job.status = "canceled"
         job.message = "任务已取消，所有试跑均已停止；不会发布最小样本。"
         job.result_path = None  # never publish after cancel
+        job.result_rows = 0
         job.finished_at = time.time()
         self._emit(job, {"event": "terminal", "id": job.id,
                          "status": "canceled"})
 
-    def _finish_timeout(self, job: Job, stage: str) -> None:
+    def _finish_timeout(self, job: Job, stage: str,
+                        result=None) -> None:
         job.status = "timed_out"
+        detail = ""
+        if result is not None:
+            # Record whether the limit fired during input transfer: this is
+            # exactly the "child stopped accepting input" scenario.
+            if result.input_complete is False:
+                stage = f"{stage}，输入传送中"
+            detail = (
+                f" 试跑已停止并回收（returncode={result.returncode}，"
+                f"输入传送 {result.input_bytes_sent}/{result.input_bytes_total}"
+                f" 字节，{'已完成' if result.input_complete else '未完成'}）。"
+            )
+            job.progress.last_input_bytes_sent = result.input_bytes_sent
+            job.progress.last_input_bytes_total = result.input_bytes_total
+            job.progress.last_input_complete = result.input_complete
         job.message = (
             f"有试跑超过 {TRIAL_TIMEOUT_SECONDS:.0f} 秒上限（阶段：{stage}），"
-            "任务未完成，不发布最小样本。"
+            f"任务未完成，不发布最小样本。{detail}"
         )
         job.result_path = None
+        job.result_rows = 0
         job.finished_at = time.time()
         self._emit(job, {"event": "terminal", "id": job.id,
                          "status": "timed_out"})

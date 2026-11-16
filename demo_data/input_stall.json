@@ -1,0 +1,10 @@
+{
+  "id": "input_stall",
+  "name": "演示 C：试跑进程停止接收输入（输入传送中取消/超时）",
+  "description": "1000 行、每行 value 带大量尾部空白的合法大输入（CSV 约 314 KiB，试跑载荷约 331 KiB，远大于管道缓冲）。提交时可勾选「模拟试跑进程暂停接收输入」，子进程会在读取 stdin 前停顿指定秒数：此时输入传送未完成，2 秒限额仍从进程启动起算，超时或取消都会先停止并回收进程、关闭输入管道，再报告终态且不发布样本。不勾选停顿则正常完整试跑，可缩减到 1 行。",
+  "rows": 1000,
+  "expected_min_rows": 1,
+  "error_type": "InvalidInputException",
+  "demo_input_stall_seconds": 6,
+  "sql": "SELECT item, SUM(1 // CAST(value AS INTEGER)) AS total FROM readings GROUP BY item"
+}

@@ -60,14 +60,22 @@ async def index() -> HTMLResponse:
 async def create_job(
     file: UploadFile = File(...),
     sql: str = Form(...),
+    demo_input_stall_seconds: float = Form(0.0),
 ):
     content = await file.read()
     try:
         parsed = parse_csv(content)
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if demo_input_stall_seconds < 0 or demo_input_stall_seconds > 60:
+        raise HTTPException(
+            status_code=400,
+            detail="演示用输入停顿参数必须在 0~60 秒之间",
+        )
     try:
-        job = manager.create_job(parsed, sql)
+        job = manager.create_job(
+            parsed, sql, input_stall_seconds=demo_input_stall_seconds
+        )
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JSONResponse(job.public())
